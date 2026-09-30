@@ -4,7 +4,7 @@ import { useState, type FormEvent } from "react";
 import { Button } from "@/components/ui/button";
 import { getGarment } from "@/domain/wardrobe";
 import { GARMENT_CATEGORIES } from "@/domain/garment";
-import type { SavedLook } from "@/lib/client/session-store";
+import type { LookDTO } from "@/lib/api-types";
 
 const dateFmt = new Intl.DateTimeFormat("en", { day: "numeric", month: "short", year: "numeric" });
 
@@ -14,7 +14,7 @@ export function LookCard({
   onRename,
   onDelete,
 }: {
-  look: SavedLook;
+  look: LookDTO;
   onOpen: () => void;
   onRename: (name: string) => void;
   onDelete: () => void;
@@ -23,7 +23,7 @@ export function LookCard({
   const [draft, setDraft] = useState(look.name);
   const [confirmDelete, setConfirmDelete] = useState(false);
 
-  const garments = GARMENT_CATEGORIES.map((c) => getGarment(look.selection[c])?.name).filter(Boolean);
+  const garments = GARMENT_CATEGORIES.map((c) => (look.selection[c] ? getGarment(look.selection[c]!)?.name : undefined)).filter(Boolean);
 
   function submit(e: FormEvent) {
     e.preventDefault();

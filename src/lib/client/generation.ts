@@ -1,12 +1,14 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { lookKey, resolveLook, type LookSelection } from "@/domain/look";
-import type { Profile } from "@/domain/profile";
-import { GARMENT_CATEGORIES } from "@/domain/garment";
+import type { LookSelection } from "@/domain/look";
+import type { GenerationDTO, ProfileDTO } from "@/lib/api-types";
 import { track } from "@/lib/analytics";
-import { createTryOnProvider, type VirtualTryOnProvider, type TryOnError } from "@/lib/tryon";
-import { sessionActions, type SessionState } from "./session-store";
+import { GENERATION_MESSAGES } from "@/lib/messages";
+import { api, ApiError } from "./api";
+import { sessionActions } from "./session-store";
+
+export { GENERATION_MESSAGES };
 
 export type GenerationPhase = "idle" | "generating" | "error";
 
@@ -14,47 +16,20 @@ export interface GenerationState {
   phase: GenerationPhase;
   /** User-facing message; never a raw provider error. */
   message?: string;
-  pendingKey?: string;
 }
 
-const POLL_MS = 600;
-const TIMEOUT_MS = 90_000;
-
-export const GENERATION_MESSAGES: Record<TryOnError["code"], string> = {
-  bad_input: "We couldn't use this photo. Try a clearer image with your face visible.",
-  provider_failed: "That look didn't generate properly.",
-  provider_unavailable: "Suit Lab is having trouble creating this look right now.",
-  timeout: "Suit Lab is having trouble creating this look right now.",
-};
-
-let clientProvider: VirtualTryOnProvider | null = null;
-
-/**
- * Phase 1: the mock provider runs in the browser.
- * Phase 2 replaces this with calls to the app's generation API; the hook's contract stays.
- */
-function getProvider(): VirtualTryOnProvider {
-  if (!clientProvider) {
-    let failureRate = 0;
-    try {
-      failureRate = Number(window.localStorage.getItem("suitlab.mock.failureRate") ?? 0) || 0;
-    } catch {}
-    clientProvider = createTryOnProvider("mock", { failureRate });
-  }
-  return clientProvider;
-}
-
-export function setClientProviderForTests(p: VirtualTryOnProvider | null) {
-  clientProvider = p;
-}
+export const POLL_MS = 1500;
+/** Client-side ceiling; the server also times jobs out on its own. */
+export const CLIENT_TIMEOUT_MS = 5 * 60_000;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-export function findCachedResult(state: Pick<SessionState, "results">, profileId: string, key: string) {
-  return state.results.find((r) => r.profileId === profileId && r.lookKey === key);
-}
-
-export function useGeneration(profile: Profile | null, results: SessionState["results"]) {
+/**
+ * Starts a server-side generation and polls it until it finishes.
+ * One in flight at a time (double clicks are ignored); identical requests are
+ * de-duplicated and cached by the server.
+ */
+export function useGeneration(profile: ProfileDTO | null) {
   const [state, setState] = useState<GenerationState>({ phase: "idle" });
   const inFlight = useRef(false);
   const alive = useRef(true);
@@ -68,59 +43,39 @@ export function useGeneration(profile: Profile | null, results: SessionState["re
 
   const generate = useCallback(
     async (selection: LookSelection, source: "studio" | "stylist" = "studio") => {
-      if (!profile || inFlight.current) return; // lock: ignore double clicks / concurrent requests
-      const key = lookKey(selection);
-      const cached = findCachedResult({ results }, profile.id, key);
-      if (cached) {
-        sessionActions.showResult(key);
-        setState({ phase: "idle" });
-        track("look_generation_completed", { cached: true, source });
-        return;
-      }
-
+      if (!profile || inFlight.current) return;
       inFlight.current = true;
-      setState({ phase: "generating", pendingKey: key });
+      setState({ phase: "generating" });
       const started = Date.now();
       track("look_generation_started", { source, ...selection });
 
-      const fail = (code: TryOnError["code"]) => {
+      const fail = (message: string, code: string) => {
         track("look_generation_failed", { code, source });
-        if (alive.current) setState({ phase: "error", message: GENERATION_MESSAGES[code], pendingKey: key });
+        if (alive.current) setState({ phase: "error", message });
       };
 
       try {
-        const provider = getProvider();
-        const resolved = resolveLook(selection);
-        let job = await provider.submit({
-          personImage: { url: profile.modelImageUrl },
-          garments: GARMENT_CATEGORIES.map((c) => resolved[c]),
-          options: { build: profile.build },
-        });
-        while (job.status === "queued" || job.status === "processing") {
-          if (Date.now() - started > TIMEOUT_MS) return fail("timeout");
+        let { generation } = await api.startGeneration(profile.id, selection);
+        while (generation.status === "queued" || generation.status === "processing") {
           if (!alive.current) return;
+          if (Date.now() - started > CLIENT_TIMEOUT_MS) return fail(GENERATION_MESSAGES.timeout, "client_timeout");
           await sleep(POLL_MS);
-          job = await provider.getStatus(job.providerJobId);
+          ({ generation } = await api.getGeneration(generation.id));
         }
-        if (job.status === "failed" || !job.outputUrl) return fail(job.error?.code ?? "provider_failed");
-
-        sessionActions.addResult({
-          profileId: profile.id,
-          lookKey: key,
-          selection,
-          imageUrl: job.outputUrl,
-          createdAt: new Date().toISOString(),
-        });
-        track("look_generation_completed", { cached: false, source, duration_ms: Date.now() - started });
+        if (generation.status === "failed" || !generation.imageUrl) {
+          return fail(generation.errorMessage ?? GENERATION_MESSAGES.provider_failed, "failed");
+        }
+        sessionActions.addResult(generation as GenerationDTO);
+        track("look_generation_completed", { cached: generation.cacheHit, source, duration_ms: Date.now() - started });
         if (source === "stylist") track("ai_stylist_look_generated", {});
         if (alive.current) setState({ phase: "idle" });
-      } catch {
-        fail("provider_unavailable");
+      } catch (e) {
+        fail(e instanceof ApiError ? e.message : GENERATION_MESSAGES.provider_unavailable, e instanceof ApiError ? e.code : "network");
       } finally {
         inFlight.current = false;
       }
     },
-    [profile, results],
+    [profile],
   );
 
   const dismissError = useCallback(() => setState({ phase: "idle" }), []);

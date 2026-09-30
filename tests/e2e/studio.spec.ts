@@ -44,15 +44,13 @@ test("selecting garments does not generate; Generate Look does", async ({ page }
 test("failed generation recovers with Try Again", async ({ page }) => {
   await useDemoModel(page);
   await forceMockFailures(page);
-  await page.reload();
   await page.getByTestId("generate-look").click();
   const alert = page.getByRole("alert").filter({ hasText: "That look didn't generate properly." });
   await expect(alert).toBeVisible({ timeout: 10_000 });
   await expect(alert.getByRole("button", { name: "Try Again" })).toBeVisible();
 
-  await page.evaluate(() => localStorage.removeItem("suitlab.mock.failureRate"));
-  await page.reload();
-  await page.getByTestId("generate-look").click();
+  await forceMockFailures(page, false);
+  await alert.getByRole("button", { name: "Try Again" }).click();
   await expect(page.getByTestId("stage-image")).toHaveAttribute("data-view", "look", { timeout: 10_000 });
 });
 
@@ -93,4 +91,21 @@ test("wardrobe is keyboard operable", async ({ page }) => {
   await expect(page.getByRole("radio", { name: /Crisp White/ })).toBeFocused();
   await page.keyboard.press("ArrowRight");
   await expect(page.getByRole("radio", { name: /Light Blue/ })).toHaveAttribute("aria-checked", "true");
+});
+
+test("delete my photo, model and looks", async ({ page }) => {
+  await useDemoModel(page);
+  await page.getByTestId("generate-look").click();
+  await expect(page.getByTestId("stage-image")).toHaveAttribute("data-view", "look", { timeout: 10_000 });
+  await page.getByRole("button", { name: "Save Look" }).click();
+  await expect(page.getByText("Saved as Look 01")).toBeVisible();
+
+  await page.goto("/looks");
+  await expect(page.getByTestId("look-card")).toHaveCount(1);
+  await page.getByRole("button", { name: "Delete my photo, model and looks" }).click();
+  await page.getByRole("button", { name: "Delete everything" }).click();
+  await expect(page.getByText("You haven't saved a look yet.")).toBeVisible();
+
+  await page.goto("/studio");
+  await expect(page.getByText("Create your model before entering the studio.")).toBeVisible();
 });

@@ -1,10 +1,10 @@
 "use client";
 
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Button, ButtonLink } from "@/components/ui/button";
-import { lookKey } from "@/domain/look";
-import { sessionActions, useSession, type SavedLook } from "@/lib/client/session-store";
+import type { LookDTO } from "@/lib/api-types";
+import { appliedKey, sessionActions, useSession } from "@/lib/client/session-store";
 import { LookCard } from "./look-card";
 
 export function MyLooks() {
@@ -13,17 +13,25 @@ export function MyLooks() {
   const profile = useSession((s) => s.profile);
   const looks = useSession((s) => s.looks);
   const [confirmReset, setConfirmReset] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void sessionActions.load();
+  }, []);
 
   if (!hydrated) return <div aria-busy="true" className="flex-1" />;
 
-  function open(look: SavedLook) {
+  function open(look: LookDTO) {
     sessionActions.setLook(look.selection);
-    if (profile?.id === look.profileId) {
+    if (profile?.id === look.profileId && look.generationId) {
       sessionActions.addResult({
-        profileId: look.profileId,
-        lookKey: lookKey(look.selection),
-        selection: look.selection,
+        id: look.generationId,
+        status: "completed",
+        applied: look.selection,
+        lookKey: appliedKey(look.selection),
         imageUrl: look.imageUrl,
+        errorMessage: null,
+        cacheHit: false,
         createdAt: look.createdAt,
       });
     }
@@ -48,8 +56,8 @@ export function MyLooks() {
               <LookCard
                 look={look}
                 onOpen={() => open(look)}
-                onRename={(name) => sessionActions.renameLook(look.id, name)}
-                onDelete={() => sessionActions.deleteLook(look.id)}
+                onRename={(name) => void sessionActions.renameLook(look.id, name)}
+                onDelete={() => void sessionActions.deleteLook(look.id).catch(() => {})}
               />
             </li>
           ))}
@@ -59,7 +67,8 @@ export function MyLooks() {
       {(profile || looks.length > 0) && (
         <section aria-label="Your data" className="mt-20 border-t border-line pt-6">
           <p className="max-w-xl text-xs leading-relaxed text-muted">
-            Your photo, model and looks are stored only in this browser in this version of Suit Lab.
+            Your photo, model and generated looks are stored privately on Suit Lab&apos;s servers. Deleting removes them from
+            our database and storage.
           </p>
           <div className="mt-3 flex gap-1">
             {confirmReset ? (
@@ -67,9 +76,14 @@ export function MyLooks() {
                 <Button
                   variant="ghost"
                   className="-ml-3 text-burgundy"
-                  onClick={() => {
-                    sessionActions.resetAll();
-                    setConfirmReset(false);
+                  onClick={async () => {
+                    setResetError(null);
+                    try {
+                      await sessionActions.resetAll();
+                      setConfirmReset(false);
+                    } catch {
+                      setResetError("We couldn't delete your data just now. Please try again.");
+                    }
                   }}
                 >
                   Delete everything
@@ -84,6 +98,11 @@ export function MyLooks() {
               </Button>
             )}
           </div>
+          {resetError && (
+            <p role="alert" className="mt-2 text-sm text-burgundy">
+              {resetError}
+            </p>
+          )}
         </section>
       )}
     </main>

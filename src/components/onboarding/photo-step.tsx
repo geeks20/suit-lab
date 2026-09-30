@@ -103,7 +103,7 @@ export function PhotoStep({
         <Button size="lg" disabled={!photo || busy} onClick={onContinue}>
           Continue
         </Button>
-        <p className="text-xs text-muted">Your photo stays in this browser in this version.</p>
+        <p className="text-xs text-muted">Your photo is stored privately. You can delete it any time from My Looks.</p>
       </div>
     </div>
   );

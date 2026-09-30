@@ -22,7 +22,11 @@ test("upload photo, enter details and land in the studio", async ({ page, browse
 
   await expect(page.getByText("Preparing your model…")).toBeVisible();
   await page.waitForURL("**/studio", { timeout: 15_000 });
-  await expect(page.getByTestId("stage-image")).toHaveAttribute("src", /^data:image\/jpeg/);
+  // Served privately from storage through a signed, expiring URL.
+  await expect(page.getByTestId("stage-image")).toHaveAttribute("src", /^\/api\/files\/users\/[0-9a-f-]+\/profiles\/[0-9a-f-]+\/source\.jpg\?exp=\d+&sig=/);
+  const src = await page.getByTestId("stage-image").getAttribute("src");
+  expect((await page.request.get(src!)).status()).toBe(200);
+  expect((await page.request.get(src!.replace(/sig=[^&]+/, "sig=forged"))).status()).toBe(403);
 });
 
 test("rejects an unusable upload with a friendly message", async ({ page }) => {

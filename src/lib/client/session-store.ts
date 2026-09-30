@@ -1,49 +1,36 @@
 "use client";
 
 import { useSyncExternalStore } from "react";
-import type { GarmentCategory } from "@/domain/garment";
+import { GARMENT_CATEGORIES, type GarmentCategory } from "@/domain/garment";
 import { DEFAULT_LOOK, sanitizeLook, type LookSelection } from "@/domain/look";
-import type { Profile } from "@/domain/profile";
+import type { AppliedSelection, CapabilitiesDTO, GenerationDTO, LookDTO, ProfileDTO } from "@/lib/api-types";
+import { api, ApiError } from "./api";
 
 /**
- * V0 session store. Everything lives in this browser (localStorage) — there is
- * no server copy yet. Phase 2 moves profiles, looks and images server-side.
+ * Client view of the session. The server is the source of truth for the profile,
+ * generations and looks; only the in-progress outfit and the on-stage result key
+ * are kept in localStorage (no images, no personal data).
  */
-
-export interface GeneratedResult {
-  profileId: string;
-  lookKey: string;
-  selection: LookSelection;
-  imageUrl: string;
-  createdAt: string;
-}
-
-export interface SavedLook {
-  id: string;
-  profileId: string;
-  name: string;
-  selection: LookSelection;
-  imageUrl: string;
-  createdAt: string;
-}
-
 export interface SessionState {
   hydrated: boolean;
-  profile: Profile | null;
+  loadError: string | null;
+  profile: ProfileDTO | null;
+  capabilities: CapabilitiesDTO | null;
   currentLook: LookSelection;
-  /** Recent generations, newest first. Doubles as the duplicate-generation cache. */
-  results: GeneratedResult[];
+  /** Completed results, newest first. */
+  results: GenerationDTO[];
   /** lookKey of the result currently on the stage. */
   displayedKey: string | null;
-  looks: SavedLook[];
+  looks: LookDTO[];
 }
 
-const STORAGE_KEY = "suitlab.session.v1";
-const MAX_RESULTS = 12;
+const STORAGE_KEY = "suitlab.studio.v2";
 
 const INITIAL: SessionState = {
   hydrated: false,
+  loadError: null,
   profile: null,
+  capabilities: null,
   currentLook: DEFAULT_LOOK,
   results: [],
   displayedKey: null,
@@ -51,59 +38,40 @@ const INITIAL: SessionState = {
 };
 
 let state: SessionState = INITIAL;
-let loaded = false;
+let localLoaded = false;
+let loading: Promise<void> | null = null;
 const listeners = new Set<() => void>();
 
-function load(): SessionState {
+function readLocal(): Pick<SessionState, "currentLook" | "displayedKey"> {
   try {
-    const raw = typeof window !== "undefined" ? window.localStorage.getItem(STORAGE_KEY) : null;
-    if (!raw) return { ...INITIAL, hydrated: true };
-    const parsed = JSON.parse(raw) as Partial<SessionState>;
-    return {
-      hydrated: true,
-      profile: parsed.profile ?? null,
-      currentLook: sanitizeLook(parsed.currentLook),
-      results: Array.isArray(parsed.results) ? parsed.results.slice(0, MAX_RESULTS) : [],
-      displayedKey: parsed.displayedKey ?? null,
-      looks: Array.isArray(parsed.looks) ? parsed.looks : [],
-    };
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : {};
+    return { currentLook: sanitizeLook(parsed.currentLook), displayedKey: typeof parsed.displayedKey === "string" ? parsed.displayedKey : null };
   } catch {
-    return { ...INITIAL, hydrated: true };
+    return { currentLook: DEFAULT_LOOK, displayedKey: null };
   }
 }
 
-function ensureLoaded() {
-  if (!loaded && typeof window !== "undefined") {
-    loaded = true;
-    state = load();
-  }
-}
-
-/** Last write error, surfaced by the UI (e.g. storage full). */
-export let lastPersistError: string | null = null;
-
-function persist() {
+function writeLocal() {
   try {
-    const { profile, currentLook, results, displayedKey, looks } = state;
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ profile, currentLook, results, displayedKey, looks }));
-    lastPersistError = null;
-    return true;
-  } catch {
-    lastPersistError = "Your browser storage is full. Delete a saved look and try again.";
-    return false;
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ currentLook: state.currentLook, displayedKey: state.displayedKey }));
+  } catch {}
+}
+
+function ensureLocal() {
+  if (!localLoaded && typeof window !== "undefined") {
+    localLoaded = true;
+    state = { ...state, ...readLocal() };
   }
 }
 
-function setState(update: (s: SessionState) => SessionState): boolean {
-  ensureLoaded();
+function set(update: (s: SessionState) => SessionState) {
+  ensureLocal();
   const next = update(state);
-  if (next === state) return true;
-  const prev = state;
+  if (next === state) return;
   state = next;
-  const ok = persist();
-  if (!ok) state = prev;
+  writeLocal();
   listeners.forEach((l) => l());
-  return ok;
 }
 
 function subscribe(listener: () => void) {
@@ -112,77 +80,95 @@ function subscribe(listener: () => void) {
 }
 
 function getSnapshot() {
-  ensureLoaded();
+  ensureLocal();
   return state;
 }
 
-const getServerSnapshot = () => INITIAL;
-
 export function useSession<T>(selector: (s: SessionState) => T): T {
-  return useSyncExternalStore(
-    subscribe,
-    () => selector(getSnapshot()),
-    () => selector(getServerSnapshot()),
-  );
+  return useSyncExternalStore(subscribe, () => selector(getSnapshot()), () => selector(INITIAL));
+}
+
+export function getSessionState() {
+  return getSnapshot();
+}
+
+/** Key of the garments a provider would apply from a selection (all categories when unknown). */
+export function appliedKey(selection: LookSelection | AppliedSelection, categories?: GarmentCategory[]): string {
+  return GARMENT_CATEGORIES.filter((c) => (!categories || categories.includes(c)) && selection[c])
+    .map((c) => selection[c])
+    .join("|");
 }
 
 export const sessionActions = {
-  setProfile(profile: Profile) {
-    return setState((s) => ({ ...s, profile, results: [], displayedKey: null }));
+  /** Loads (or refreshes) server state. Signed image URLs are re-issued on every load. */
+  load(): Promise<void> {
+    loading ??= api
+      .session()
+      .then((s) =>
+        set((st) => ({
+          ...st,
+          hydrated: true,
+          loadError: null,
+          profile: s.profile,
+          capabilities: s.capabilities,
+          results: s.generations,
+          looks: s.looks,
+          displayedKey: s.generations.some((g) => g.lookKey === st.displayedKey) ? st.displayedKey : null,
+        })),
+      )
+      .catch((e) => set((st) => ({ ...st, hydrated: true, loadError: e instanceof ApiError ? e.message : "Couldn't load your studio." })))
+      .finally(() => {
+        loading = null;
+      });
+    return loading;
+  },
+  setProfile(profile: ProfileDTO) {
+    set((s) => ({ ...s, hydrated: true, profile, results: [], displayedKey: null }));
   },
   selectGarment(category: GarmentCategory, garmentId: string) {
-    return setState((s) =>
-      s.currentLook[category] === garmentId ? s : { ...s, currentLook: { ...s.currentLook, [category]: garmentId } },
-    );
+    set((s) => (s.currentLook[category] === garmentId ? s : { ...s, currentLook: { ...s.currentLook, [category]: garmentId } }));
   },
-  setLook(selection: LookSelection) {
-    return setState((s) => ({ ...s, currentLook: sanitizeLook(selection) }));
+  setLook(selection: Partial<LookSelection>) {
+    set((s) => ({ ...s, currentLook: sanitizeLook({ ...s.currentLook, ...selection }) }));
   },
-  addResult(result: GeneratedResult) {
-    return setState((s) => ({
-      ...s,
-      results: [result, ...s.results.filter((r) => !(r.profileId === result.profileId && r.lookKey === result.lookKey))].slice(0, MAX_RESULTS),
-      displayedKey: result.lookKey,
-    }));
+  addResult(result: GenerationDTO) {
+    set((s) => ({ ...s, results: [result, ...s.results.filter((r) => r.lookKey !== result.lookKey)], displayedKey: result.lookKey }));
   },
   showResult(lookKey: string | null) {
-    return setState((s) => (s.displayedKey === lookKey ? s : { ...s, displayedKey: lookKey }));
+    set((s) => (s.displayedKey === lookKey ? s : { ...s, displayedKey: lookKey }));
   },
-  saveLook(look: Omit<SavedLook, "id" | "name" | "createdAt"> & { name?: string }): SavedLook | null {
-    const saved: SavedLook = {
-      id: crypto.randomUUID(),
-      createdAt: new Date().toISOString(),
-      name: look.name ?? nextLookName(state.looks),
-      profileId: look.profileId,
-      selection: look.selection,
-      imageUrl: look.imageUrl,
-    };
-    return setState((s) => ({ ...s, looks: [saved, ...s.looks] })) ? saved : null;
+  async saveLook(generationId: string) {
+    const res = await api.saveLook(generationId);
+    set((s) => ({ ...s, looks: [res.look, ...s.looks.filter((l) => l.id !== res.look.id)] }));
+    return res;
   },
-  renameLook(id: string, name: string) {
+  async renameLook(id: string, name: string) {
     const clean = name.trim().slice(0, 60);
     if (!clean) return false;
-    return setState((s) => ({ ...s, looks: s.looks.map((l) => (l.id === id ? { ...l, name: clean } : l)) }));
+    const prev = state.looks;
+    set((s) => ({ ...s, looks: s.looks.map((l) => (l.id === id ? { ...l, name: clean } : l)) }));
+    try {
+      await api.renameLook(id, clean);
+      return true;
+    } catch {
+      set((s) => ({ ...s, looks: prev }));
+      return false;
+    }
   },
-  deleteLook(id: string) {
-    return setState((s) => ({ ...s, looks: s.looks.filter((l) => l.id !== id) }));
+  async deleteLook(id: string) {
+    await api.deleteLook(id);
+    set((s) => ({ ...s, looks: s.looks.filter((l) => l.id !== id) }));
   },
-  /** Deletes the model, its photo and every generation/look. */
-  resetAll() {
-    return setState(() => ({ ...INITIAL, hydrated: true }));
+  /** Deletes the model, photo, generations and looks on the server and in this browser. */
+  async resetAll() {
+    await api.deleteMe();
+    set(() => ({ ...INITIAL, hydrated: true, capabilities: state.capabilities }));
   },
 };
-
-export function nextLookName(looks: SavedLook[]): string {
-  const used = new Set(looks.map((l) => l.name));
-  for (let n = looks.length + 1; ; n++) {
-    const name = `Look ${String(n).padStart(2, "0")}`;
-    if (!used.has(name)) return name;
-  }
-}
 
 /** Test-only: reset module state. */
 export function __resetSessionForTests() {
   state = INITIAL;
-  loaded = false;
+  localLoaded = false;
+  loading = null;
 }

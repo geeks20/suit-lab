@@ -4,6 +4,7 @@ import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { DEFAULT_DETAILS, type ProfileDetails } from "@/domain/profile";
 import { sessionActions } from "@/lib/client/session-store";
+import { api, ApiError, dataUrlToBlob } from "@/lib/client/api";
 import { track } from "@/lib/analytics";
 import { PhotoStep } from "./photo-step";
 import { DetailsStep } from "./details-step";
@@ -11,7 +12,7 @@ import { Preparing } from "./preparing";
 
 type Step = "photo" | "details" | "preparing";
 
-const PREPARE_MS = 3600;
+const MIN_PREPARE_MS = 2400;
 
 export function CreateModelFlow() {
   const router = useRouter();
@@ -26,22 +27,20 @@ export function CreateModelFlow() {
     setError(null);
     setStep("preparing");
     track("model_creation_started", { build: d.build });
-    // Phase 1: no model-preparation service yet; the photo is used as-is.
-    await new Promise((r) => setTimeout(r, PREPARE_MS));
-    const ok = sessionActions.setProfile({
-      id: crypto.randomUUID(),
-      ...d,
-      sourceImageUrl: photo,
-      modelImageUrl: photo,
-      isDemo: false,
-      createdAt: new Date().toISOString(),
-    });
-    if (!ok) {
-      setError("We couldn't save your model in this browser. Try a smaller photo.");
-      return setStep("details");
+    try {
+      // Upload runs alongside a minimum display time so the moment isn't rushed.
+      const [{ profile }] = await Promise.all([
+        dataUrlToBlob(photo).then((blob) => api.createProfile(blob, d)),
+        new Promise((r) => setTimeout(r, MIN_PREPARE_MS)),
+      ]);
+      sessionActions.setProfile(profile);
+      track("model_creation_completed", { build: d.build });
+      router.push("/studio");
+    } catch (e) {
+      const message = e instanceof ApiError ? e.message : "We couldn't create your model. Please try again.";
+      setError(message);
+      setStep(e instanceof ApiError && e.code.startsWith("upload_") ? "photo" : "details");
     }
-    track("model_creation_completed", { build: d.build });
-    router.push("/studio");
   }
 
   return (
